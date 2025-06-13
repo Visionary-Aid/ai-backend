@@ -1,18 +1,17 @@
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse, FileResponse
-import torch
+from fastapi.responses import FileResponse, JSONResponse
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from torchvision import transforms
 from PIL import Image
 from gtts import gTTS
+import torch
 import os
 import uuid
 
+# === إعداد التطبيق ===
 app = FastAPI()
-model = efficientnet_b0(weights=None)
-model.classifier[1] = torch.nn.Linear(1280, 5)  # 5 classes
-model.load_state_dict(torch.load("models/model.pth", map_location="cpu"))
-model.eval()
+
+# === الأصناف المستخدمة ===
 class_names = ['person', 'car', 'dog', 'cat', 'bicycle']
 label_translations = {
     'person': 'شخص',
@@ -21,47 +20,67 @@ label_translations = {
     'cat': 'قطة',
     'bicycle': 'دراجة'
 }
-weights = EfficientNet_B0_Weights.DEFAULT
-transform = weights.transforms()
+
+# === تحميل الموديل ===
+model = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+model.classifier[1] = torch.nn.Linear(model.classifier[1].in_features, len(class_names))
+model.load_state_dict(torch.load("models/model.pth", map_location="cpu"))
+model.eval()
+
+# === التحويلات ===
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# === مسار حفظ الملفات الصوتية المؤقتة ===
+os.makedirs("audio", exist_ok=True)
+
+# === نقطة التوقع ===
 @app.post("/predict/")
-async def predict_image(file: UploadFile = File(...)):
-    temp_image_path = f"temp_{uuid.uuid4().hex}.jpg"
+async def predict(file: UploadFile = File(...)):
+    image_id = uuid.uuid4().hex
+    temp_image_path = f"temp_{image_id}.jpg"
+    audio_path = f"models/{image_id}.mp3"  # <-- هنا التغيير
+
     try:
-    
-        with open(temp_image_path, "wb") as buffer:
-            buffer.write(await file.read())
+        # حفظ الصورة المرفوعة مؤقتاً
+        with open(temp_image_path, "wb") as f:
+            f.write(await file.read())
 
-        
+        # تحميل الصورة وتحويلها
         image = Image.open(temp_image_path).convert("RGB")
-        input_tensor = transform(image).unsqueeze(0)
+        image_tensor = transform(image).unsqueeze(0)
 
-        
+        # التوقع
         with torch.no_grad():
-            output = model(input_tensor)
-            predicted_index = torch.argmax(output, dim=1).item()
-            label = class_names[predicted_index]
+            output = model(image_tensor)
+            _, predicted = torch.max(output, 1)
+            label = class_names[predicted.item()]
             arabic_label = label_translations[label]
 
-        
-        speech_text = f"الصورة تحتوي على {arabic_label}"
-        audio_filename = f"{uuid.uuid4().hex}.mp3"
-        tts = gTTS(text=speech_text, lang='ar')
-        tts.save(audio_filename)
+        # تحويل التوقع إلى صوت
+        text = f"الصورة تحتوي على {arabic_label}"
+        tts = gTTS(text, lang='ar')
+        tts.save(audio_path)
 
         return {
             "predicted_label": label,
             "arabic_label": arabic_label,
-            "audio_file": f"/audio/{audio_filename}"
+            "audio_url": f"/audio/{image_id}.mp3"
         }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
     finally:
         if os.path.exists(temp_image_path):
             os.remove(temp_image_path)
 
-
+# === نقطة تشغيل ملف الصوت ===
 @app.get("/audio/{filename}")
 def get_audio(filename: str):
-    file_path = os.path.join(".", filename)
-    if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="audio/mpeg", filename=filename)
+    path = os.path.join("models", filename)  # <-- هنا التغيير
+    if os.path.exists(path):
+        return FileResponse(path, media_type="audio/mpeg", filename=filename)
     return JSONResponse(status_code=404, content={"message": "Audio file not found"})
